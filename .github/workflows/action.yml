@@ -405,8 +405,6 @@ jobs:
 
           while ($true) {
 
-              Write-Host "[$(Get-Date)] RDP Active - $env:TAILSCALE_IP"
-
-              Start-Sleep -Seconds 300
-
+          Write-Host "[$(Get-Date)] RDP Active - $env:TAILSCALE_IP"
+          Start-Sleep -Seconds 300
 }
