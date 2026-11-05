@@ -399,12 +399,12 @@ jobs:
           # 10. KEEP RDP ACTIVE
           # ======================================
 
-          Write-Host ""
-          Write-Host "[+] RDP IS READY."
-          Write-Host "[+] Waiting for workflow cancellation."
+         # Write-Host ""
+         # Write-Host "[+] RDP IS READY."
+          #Write-Host "[+] Waiting for workflow cancellation."
 
-          while ($true) {
+         # while ($true) {
 
-          Write-Host "[$(Get-Date)] RDP Active - $env:TAILSCALE_IP"
-          Start-Sleep -Seconds 300
+        # Write-Host "[$(Get-Date)] RDP Active - $env:TAILSCALE_IP"
+      #   Start-Sleep -Seconds 300
 }
