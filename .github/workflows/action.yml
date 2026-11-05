@@ -1,0 +1,412 @@
+name: VisualStudioCode (Debugger)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+
+      # ==========================================
+      # 1. CHECKOUT REPOSITORY
+      # ==========================================
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ==========================================
+      # 2. CONFIGURE WINDOWS RDP
+      # ==========================================
+
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          Write-Host "[+] Configuring Windows RDP..."
+
+          # Enable Remote Desktop
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" `
+            -Value 0 -Force
+
+          # Enable Network Level Authentication
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" `
+            -Value 1 -Force
+
+          # Enable TLS security layer
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" `
+            -Value 2 -Force
+
+          # Allow RDP only from Tailscale IPv4 addresses
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any
+
+          Restart-Service -Name TermService -Force
+
+          Write-Host "[+] RDP configured."
+
+      # ==========================================
+      # 3. CREATE RDP USER WITH FIXED PASSWORD
+      # ==========================================
+
+      - name: Configure RDP User
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              throw "PASSWORD secret is missing."
+          }
+
+          Write-Host "[+] Configuring RDP user..."
+
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText -Force
+
+          $existingUser = Get-LocalUser `
+            -Name "RDP" `
+            -ErrorAction SilentlyContinue
+
+          if ($existingUser) {
+
+              Set-LocalUser `
+                -Name "RDP" `
+                -Password $securePass
+
+          }
+          else {
+
+              New-LocalUser `
+                -Name "RDP" `
+                -Password $securePass `
+                -AccountNeverExpires
+
+          }
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "RDP" `
+            -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "RDP" `
+            -ErrorAction SilentlyContinue
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              throw "RDP user creation failed."
+          }
+
+          Write-Host "[+] RDP account ready."
+
+      # ==========================================
+      # 4. INSTALL VISUAL STUDIO CODE
+      # ==========================================
+
+      - name: Install VS Code
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "[+] Installing VS Code..."
+
+          $code = Get-Command code `
+            -ErrorAction SilentlyContinue
+
+          if (-not $code) {
+
+              winget install `
+                --id Microsoft.VisualStudioCode `
+                --exact `
+                --silent `
+                --accept-package-agreements `
+                --accept-source-agreements
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "VS Code installation failed."
+              }
+
+          }
+
+          Write-Host "[+] VS Code ready."
+
+      # ==========================================
+      # 5. SET CUSTOM WALLPAPER
+      # ==========================================
+
+      - name: Set Custom Wallpaper
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "[+] Setting custom wallpaper..."
+
+          $sourceWallpaper = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "wallpaper.jpeg"
+
+          if (-not (Test-Path $sourceWallpaper)) {
+              throw "wallpaper.jpeg not found in repository root."
+          }
+
+          $picturesPath = "$env:USERPROFILE\Pictures"
+
+          New-Item `
+            -ItemType Directory `
+            -Path $picturesPath `
+            -Force | Out-Null
+
+          $wallpaperPath = Join-Path `
+            $picturesPath `
+            "wallpaper.jpeg"
+
+          Copy-Item `
+            -Path $sourceWallpaper `
+            -Destination $wallpaperPath `
+            -Force
+
+          # Configure wallpaper
+          Set-ItemProperty `
+            -Path "HKCU:\Control Panel\Desktop" `
+            -Name Wallpaper `
+            -Value $wallpaperPath
+
+          # Wallpaper style: Fill
+          Set-ItemProperty `
+            -Path "HKCU:\Control Panel\Desktop" `
+            -Name WallpaperStyle `
+            -Value "10"
+
+          Set-ItemProperty `
+            -Path "HKCU:\Control Panel\Desktop" `
+            -Name TileWallpaper `
+            -Value "0"
+
+          # Refresh wallpaper
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+
+          public class Wallpaper {
+              [DllImport("user32.dll", SetLastError=true)]
+              public static extern bool SystemParametersInfo(
+                  int uAction,
+                  int uParam,
+                  string lpvParam,
+                  int fuWinIni
+              );
+          }
+          "@
+
+          $result = [Wallpaper]::SystemParametersInfo(
+              20,
+              0,
+              $wallpaperPath,
+              3
+          )
+
+          if (-not $result) {
+              throw "Failed to apply wallpaper."
+          }
+
+          Write-Host "[+] Custom wallpaper applied."
+
+      # ==========================================
+      # 6. INSTALL TAILSCALE
+      # ==========================================
+
+      - name: Install Tailscale
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "[+] Installing Tailscale..."
+
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri $tsUrl `
+            -OutFile $installerPath
+
+          Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
+            -Wait
+
+          Remove-Item $installerPath -Force
+
+          Write-Host "[+] Tailscale installed."
+
+      # ==========================================
+      # 7. ESTABLISH TAILSCALE CONNECTION
+      # ==========================================
+
+      - name: Establish Tailscale Connection
+        if: always()
+        shell: pwsh
+        env:
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTH_KEY)) {
+              throw "TAILSCALE_AUTH_KEY secret is missing."
+          }
+
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          Write-Host "[+] Connecting to Tailscale..."
+
+          & $tsExe up `
+            --authkey="$env:TS_AUTH_KEY" `
+            --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale connection failed."
+          }
+
+          $tsIP = $null
+
+          for ($i = 0; $i -lt 20; $i++) {
+
+              $result = & $tsExe ip -4
+
+              if ($LASTEXITCODE -eq 0 -and $result) {
+                  $tsIP = ($result | Select-Object -First 1).Trim()
+              }
+
+              if ($tsIP) {
+                  break
+              }
+
+              Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIP) {
+              throw "Tailscale IP assignment failed."
+          }
+
+          if ($tsIP -notmatch '^100\.') {
+              throw "Invalid Tailscale IP: $tsIP"
+          }
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          Write-Host "[+] Tailscale connected."
+          Write-Host "[+] IP: $tsIP"
+
+      # ==========================================
+      # 8. VERIFY RDP ACCESSIBILITY
+      # ==========================================
+
+      - name: Verify RDP Accessibility
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "[+] Testing RDP connectivity..."
+
+          $testResult = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (-not $testResult.TcpTestSucceeded) {
+              throw "RDP TCP connectivity test failed."
+          }
+
+          Write-Host "[+] RDP connectivity successful!"
+
+      # ==========================================
+      # 9. SHOW CREDENTIALS AND TELEGRAM
+      # ==========================================
+
+      - name: Get Connection Credentials
+        if: always()
+        shell: pwsh
+        env:
+          TELEGRAM_BOT: ${{ secrets.BOT }}
+          TELEGRAM_CHAT: ${{ secrets.CHAT }}
+        run: |
+
+          if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_BOT)) {
+              throw "BOT secret is missing."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_CHAT)) {
+              throw "CHAT secret is missing."
+          }
+
+          Write-Host ""
+          Write-Host "=================================="
+          Write-Host "         WINDOWS RDP ACCESS"
+          Write-Host "=================================="
+          Write-Host "Address  : $env:TAILSCALE_IP"
+          Write-Host "Username : RDP"
+          Write-Host "Password : Repository PASSWORD secret"
+          Write-Host "Port     : 3389"
+          Write-Host "=================================="
+
+          # Telegram notification
+          $message = @"
+          🖥️ WINDOWS RDP STARTED
+
+          🌐 Address: $env:TAILSCALE_IP
+          👤 Username: RDP
+          🔑 Password: Repository PASSWORD secret
+
+          📡 Network: Tailscale
+          🔌 Port: 3389
+
+          ⚙️ VS Code: Installed
+          🖼️ Custom Wallpaper: Applied
+
+          🟢 Status: Online
+
+          Run ID: $env:GITHUB_RUN_ID
+          "@
+
+          $telegramUrl = "https://api.telegram.org/bot$($env:TELEGRAM_BOT)/sendMessage"
+
+          $body = @{
+              chat_id = $env:TELEGRAM_CHAT
+              text = $message
+          }
+
+          $response = Invoke-RestMethod `
+            -Uri $telegramUrl `
+            -Method Post `
+            -Body $body
+
+          if (-not $response.ok) {
+              throw "Telegram notification failed."
+          }
+
+          Write-Host "[+] Telegram notification sent."
+
+          # ======================================
+          # 10. KEEP RDP ACTIVE
+          # ======================================
+
+          Write-Host ""
+          Write-Host "[+] RDP IS READY."
+          Write-Host "[+] Waiting for workflow cancellation."
+
+          while ($true) {
+
+              Write-Host "[$(Get-Date)] RDP Active - $env:TAILSCALE_IP"
+
+              Start-Sleep -Seconds 300
+
+}
